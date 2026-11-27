@@ -9,18 +9,27 @@ from typing import Any, Literal
 from fastapi import FastAPI, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from . import __version__, service
+from . import __version__, orders, service
 from .db import DEFAULT_DATABASE_PATH, ensure_schema
 from .errors import ApiError
 from .schemas import (
+    BatchSummaryOut,
+    DeliveryIn,
+    DeliveryOut,
+    DeliveryRejectedOut,
     ErrorOut,
     FirmwareCreate,
     FirmwareEnable,
     FirmwareOut,
     MissingErrorOut,
     MissingPrompt,
+    OrderCreate,
+    OrderOut,
     PlaybackOut,
     PlayRequest,
+    RecordingOut,
+    ReviewOut,
+    ReviewRequest,
     TemplateCreate,
     TemplateOut,
     TemplateUpdate,
@@ -53,6 +62,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             {"name": "templates", "description": "Draft, publish, withdraw, edit."},
             {"name": "firmwares", "description": "Register, configure, enable."},
             {"name": "playback", "description": "Resolve a prompt for a device."},
+            {
+                "name": "recording",
+                "description": (
+                    "制单：按最新已提交目录把带编号样例取句、按实际语种+成句全文"
+                    "合并并标出已有录音号；交件：按批号+原条目逐例复核，至少一例"
+                    "仍是原语种原句才入账，同批号同语种同句保留首个录音号。"
+                ),
+            },
             {"name": "meta", "description": "Health and diagnostics."},
         ],
     )
@@ -241,6 +258,169 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if result["fallback"]:
             response.headers["X-Prompt-Fallback"] = "en->zh"
         return result
+
+    # -- recording: 制单 / 交件 -------------------------------------------
+    @app.post(
+        "/api/recording-batches",
+        response_model=OrderOut,
+        status_code=status.HTTP_201_CREATED,
+        tags=["recording"],
+        summary="制单：按录音批号和带编号样例出单（同批号再调即再次出单）",
+        description=(
+            "整单在同一个已提交目录快照上，按现有取句规则（已发布模板、固件声明"
+            "变量、语言优先、en→zh 兜底、变量最多、发布最新）逐例取句；按**实际"
+            "语种 + 成句全文**合并成条目，并标出本批号或全录音库已有的录音号。"
+            "无法取句的样例放在 `unresolved` 中并带 `reason_code`。\n\n"
+            "同一 `batch_no` 再次提交会生成新的 `revision`（再次出单），已入账"
+            "录音号保留并自动标到新条目上。"
+        ),
+    )
+    def create_recording_order(payload: OrderCreate) -> dict[str, Any]:
+        return orders.create_order(database, payload)
+
+    @app.post("/api/orders", response_model=OrderOut,
+              status_code=status.HTTP_201_CREATED, include_in_schema=False)
+    def create_recording_order_alias(payload: OrderCreate) -> dict[str, Any]:
+        return orders.create_order(database, payload)
+
+    @app.post("/api/recording-orders", response_model=OrderOut,
+              status_code=status.HTTP_201_CREATED, include_in_schema=False)
+    def create_recording_order_alias2(payload: OrderCreate) -> dict[str, Any]:
+        return orders.create_order(database, payload)
+
+    @app.post("/api/batches", response_model=OrderOut,
+              status_code=status.HTTP_201_CREATED, include_in_schema=False)
+    def create_recording_order_alias3(payload: OrderCreate) -> dict[str, Any]:
+        return orders.create_order(database, payload)
+
+    @app.get(
+        "/api/recording-batches",
+        response_model=list[BatchSummaryOut],
+        tags=["recording"],
+        summary="列出录音批号（制单）",
+    )
+    def list_recording_batches() -> list[dict[str, Any]]:
+        return orders.list_batches(database)
+
+    @app.get(
+        "/api/recordings",
+        response_model=list[RecordingOut],
+        tags=["recording"],
+        summary="录音库：按语种/成句查询已有录音号（跨批号复用）",
+    )
+    def list_recordings(
+        lang: Literal["zh", "en"] | None = Query(default=None),
+        text: str | None = Query(default=None),
+    ) -> list[dict[str, Any]]:
+        return orders.list_library_recordings(database, lang, text)
+
+    @app.get(
+        "/api/recording-batches/{batch_no}",
+        response_model=OrderOut,
+        tags=["recording"],
+        summary="取某批号最新一次出单",
+    )
+    def get_recording_batch(batch_no: str) -> dict[str, Any]:
+        return orders.get_latest_order(database, batch_no)
+
+    @app.get(
+        "/api/recording-batches/{batch_no}/orders",
+        tags=["recording"],
+        summary="该批号的历次出单（revision 列表）",
+    )
+    def list_recording_orders(batch_no: str) -> list[dict[str, Any]]:
+        return orders.list_order_revisions(database, batch_no)
+
+    @app.get(
+        "/api/recording-batches/{batch_no}/orders/{revision}",
+        response_model=OrderOut,
+        tags=["recording"],
+        summary="取该批号指定 revision 的整张单",
+    )
+    def get_recording_order(batch_no: str, revision: int) -> dict[str, Any]:
+        return orders.get_order_revision(database, batch_no, revision)
+
+    @app.get(
+        "/api/recording-batches/{batch_no}/recordings",
+        response_model=list[RecordingOut],
+        tags=["recording"],
+        summary="该批号已入账的语种+成句→首个录音号",
+    )
+    def list_batch_recordings(batch_no: str) -> list[dict[str, Any]]:
+        return orders.list_batch_recordings(database, batch_no)
+
+    @app.get(
+        "/api/recording-batches/{batch_no}/deliveries",
+        response_model=list[DeliveryOut],
+        tags=["recording"],
+        summary="该批号已受理的交件记录（含逐例复核结果）",
+    )
+    def list_batch_deliveries(batch_no: str) -> list[dict[str, Any]]:
+        return orders.list_deliveries(database, batch_no)
+
+    @app.post(
+        "/api/recording-batches/{batch_no}/review",
+        response_model=ReviewOut,
+        tags=["recording"],
+        summary="逐例复核（不入账）：按最新已提交目录重算该条目全部样例",
+        description=(
+            "交件前的只读复核。用制单时保存的样例输入（固件号/提示号/变量值）"
+            "在**最新已提交**的模板与固件配置上重新取句，逐例判断是否仍是该条目"
+            "的原语种、原句。"
+        ),
+    )
+    def review_recording_entry(
+        batch_no: str, payload: ReviewRequest
+    ) -> dict[str, Any]:
+        return orders.review_entry(database, batch_no, payload)
+
+    @app.post(
+        "/api/deliveries",
+        response_model=DeliveryOut,
+        status_code=status.HTTP_201_CREATED,
+        tags=["recording"],
+        summary="交件：带批号、原条目（entry_id 或 entry_no）、录音号",
+        description=(
+            "只复核该条目在制单时合并的样例，按最新已提交目录重新取句。"
+            "**至少还有一例**仍取到原语种和原句才登记入账，并在 `mismatched` "
+            "中列出已不匹配样例；一例都不匹配时返回 `409 delivery_not_booked`"
+            "且不写入。同批号下同一语种+同一句已登记过录音号时，保留首个录音号，"
+            "本次交件返回 `status=reused` 与 `effective_recording_no`（首个号）。"
+        ),
+        responses={
+            404: {"model": ErrorOut, "description": "Unknown batch or entry"},
+            409: {
+                "model": DeliveryRejectedOut,
+                "description": "No sample still matches the original lang/sentence",
+            },
+        },
+    )
+    def submit_delivery(payload: DeliveryIn) -> dict[str, Any]:
+        return orders.submit_delivery(database, payload)
+
+    @app.post("/api/deliver", response_model=DeliveryOut,
+              status_code=status.HTTP_201_CREATED, include_in_schema=False)
+    def submit_delivery_singular_alias(payload: DeliveryIn) -> dict[str, Any]:
+        return orders.submit_delivery(database, payload)
+
+    @app.post(
+        "/api/recording-batches/{batch_no}/deliveries",
+        response_model=DeliveryOut,
+        status_code=status.HTTP_201_CREATED,
+        tags=["recording"],
+        summary="交件（批号在路径中）",
+        responses={
+            404: {"model": ErrorOut, "description": "Unknown batch or entry"},
+            409: {
+                "model": DeliveryRejectedOut,
+                "description": "No sample still matches the original lang/sentence",
+            },
+        },
+    )
+    def submit_batch_delivery(
+        batch_no: str, payload: DeliveryIn
+    ) -> dict[str, Any]:
+        return orders.submit_delivery(database, payload, path_batch_no=batch_no)
 
     return app
 

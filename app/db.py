@@ -54,6 +54,121 @@ CREATE TABLE IF NOT EXISTS firmware_prompts (
 
 CREATE INDEX IF NOT EXISTS idx_firmware_prompts_prompt
     ON firmware_prompts (prompt_no);
+
+-- -------------------------------------------------------------------------
+-- Recording studio: 制单 (orders) and 交件 (delivery / booking)
+-- -------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS recording_batches (
+    batch_no     TEXT    PRIMARY KEY,
+    note         TEXT,
+    revision     INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL
+);
+
+-- Every 制单 POST is one immutable order revision under a batch number.
+CREATE TABLE IF NOT EXISTS recording_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no    TEXT    NOT NULL
+        REFERENCES recording_batches (batch_no) ON DELETE CASCADE,
+    revision    INTEGER NOT NULL,
+    note        TEXT,
+    created_at  TEXT    NOT NULL,
+    UNIQUE (batch_no, revision)
+);
+
+-- A merged line ("条目") of one issued order: original language/sentence are
+-- frozen here and are what a later delivery is reviewed against.
+CREATE TABLE IF NOT EXISTS order_entries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id     INTEGER NOT NULL
+        REFERENCES recording_orders (id) ON DELETE CASCADE,
+    entry_no     INTEGER NOT NULL,
+    lang         TEXT    NOT NULL CHECK (lang IN ('zh', 'en')),
+    text         TEXT    NOT NULL,
+    template_id  INTEGER,
+    fallback     INTEGER NOT NULL DEFAULT 0,
+    recording_no TEXT,
+    created_at   TEXT    NOT NULL,
+    UNIQUE (order_id, entry_no),
+    UNIQUE (order_id, lang, text)
+);
+
+-- Numbered samples ("样例") of an order, with the resolution snapshot taken
+-- at 制单 time.  entry_id is NULL for samples listed as unresolvable.
+CREATE TABLE IF NOT EXISTS order_samples (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id         INTEGER NOT NULL
+        REFERENCES recording_orders (id) ON DELETE CASCADE,
+    entry_id         INTEGER
+        REFERENCES order_entries (id) ON DELETE CASCADE,
+    ordinal          INTEGER NOT NULL,
+    sample_no        TEXT    NOT NULL,
+    firmware_id      TEXT    NOT NULL,
+    prompt_no        TEXT    NOT NULL,
+    variables_json   TEXT    NOT NULL DEFAULT '{}',
+    status           TEXT    NOT NULL CHECK (status IN ('resolved', 'unresolved')),
+    requested_lang   TEXT,
+    used_lang        TEXT,
+    fallback         INTEGER NOT NULL DEFAULT 0,
+    template_id      INTEGER,
+    text             TEXT,
+    firmware_enabled INTEGER,
+    reason_code      TEXT,
+    reason_message   TEXT,
+    missing_json     TEXT,
+    UNIQUE (order_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_samples_entry
+    ON order_samples (entry_id);
+
+-- Batch-scoped recording registry: first recording number for a
+-- (batch_no, lang, sentence) wins and is reused by later matching samples.
+CREATE TABLE IF NOT EXISTS batch_recordings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no     TEXT    NOT NULL
+        REFERENCES recording_batches (batch_no) ON DELETE CASCADE,
+    lang         TEXT    NOT NULL CHECK (lang IN ('zh', 'en')),
+    text         TEXT    NOT NULL,
+    recording_no TEXT    NOT NULL,
+    entry_id     INTEGER,
+    delivery_id  INTEGER,
+    created_at   TEXT    NOT NULL,
+    UNIQUE (batch_no, lang, text)
+);
+
+-- Studio-wide reusable recording library: same language + same composed
+-- sentence always points at the first recording number.
+CREATE TABLE IF NOT EXISTS recordings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    lang             TEXT    NOT NULL CHECK (lang IN ('zh', 'en')),
+    text             TEXT    NOT NULL,
+    recording_no     TEXT    NOT NULL,
+    source_batch_no  TEXT,
+    created_at       TEXT    NOT NULL,
+    UNIQUE (lang, text)
+);
+
+-- Accepted (booked/reused) delivery attempts; rejected reviews return 409
+-- and write nothing, matching the catalogue's refused-mutation convention.
+CREATE TABLE IF NOT EXISTS deliveries (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no               TEXT    NOT NULL,
+    order_id               INTEGER NOT NULL,
+    entry_id               INTEGER NOT NULL,
+    submitted_recording_no TEXT    NOT NULL,
+    status                 TEXT    NOT NULL CHECK (status IN ('booked', 'reused')),
+    effective_recording_no TEXT    NOT NULL,
+    reviewed_count         INTEGER NOT NULL DEFAULT 0,
+    matched_count          INTEGER NOT NULL DEFAULT 0,
+    review_json            TEXT    NOT NULL DEFAULT '{}',
+    created_at             TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_batch
+    ON deliveries (batch_no, id);
 """
 
 

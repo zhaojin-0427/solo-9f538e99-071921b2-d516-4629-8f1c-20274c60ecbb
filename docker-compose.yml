@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: museum-prompt-api:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/prompts.db
+    volumes:
+      - prompt-data:/data
+    restart: unless-stopped
+
+volumes:
+  prompt-data:
